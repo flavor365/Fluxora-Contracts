@@ -165,11 +165,17 @@ pub struct Stream {
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct CreateStreamParams {
+    /// Address that will receive streamed tokens for this stream entry.
     pub recipient: Address,
+    /// Total amount escrowed for this stream entry.
     pub deposit_amount: i128,
+    /// Streaming speed in tokens per second for this stream entry.
     pub rate_per_second: i128,
+    /// Ledger timestamp when accrual starts for this stream entry.
     pub start_time: u64,
+    /// Ledger timestamp when withdrawals become enabled for this stream entry.
     pub cliff_time: u64,
+    /// Ledger timestamp when accrual stops for this stream entry.
     pub end_time: u64,
 }
 
@@ -650,22 +656,37 @@ impl FluxoraStream {
 
     /// Create multiple payment streams in a single transaction.
     ///
-    /// Optimizes gas usage by verifying authorization once and doing a single bulk
-    /// token transfer for all streams, executing the creations atomically.
+    /// Optimizes gas usage by authorizing once and doing a single bulk token transfer
+    /// for all streams. The batch is atomic: either all streams are created, or none are.
     ///
     /// # Parameters
     /// - `sender`: Address funding all streams in the batch
     /// - `streams`: Vector of stream configuration parameters
     ///
     /// # Returns
-    /// - `Vec<u64>`: Vector of unique stream identifiers for the newly created streams
+    /// - `Vec<u64>`: Stream IDs in the same order as `streams` input entries
     ///
     /// # Authorization
-    /// - Requires authorization from the sender address exactly once for the entire batch.
+    /// - Requires authorization from `sender` exactly once for the entire batch
     ///
-    /// # Usage Notes
-    /// - Each entry is validated with the same rules as `create_stream`
+    /// # Success Semantics
+    /// - Every entry is validated using the same rules as `create_stream`
+    /// - The total deposit is computed as `sum(entry.deposit_amount)` with checked arithmetic
+    /// - A single token transfer pulls the total from `sender` into the contract
+    /// - Streams are persisted sequentially with contiguous IDs and one `created` event per stream
+    ///
+    /// # Failure Semantics
+    /// - Any validation failure, arithmetic overflow, auth failure, or token transfer failure aborts the call
+    /// - On failure there are no persistent writes, no token movement, and no `created` events
+    ///
+    /// # Panics
+    /// - If any entry violates `create_stream` validation rules
+    /// - If total batch deposit overflows `i128` (`"overflow calculating total batch deposit"`)
+    /// - If token transfer fails due to sender balance/allowance constraints
+    ///
+    /// # Security Notes
     /// - Self-streaming is disallowed per entry: `sender` must not equal `recipient`
+    /// - Validation is completed before any external token interaction
     pub fn create_streams(
         env: Env,
         sender: Address,
@@ -676,6 +697,7 @@ impl FluxoraStream {
             panic_with_error!(&env, ContractError::ContractPaused);
         }
 
+        let current_time = env.ledger().timestamp();
         let mut total_deposit: i128 = 0;
 
         // First pass: validate all streams and calculate total deposit required
@@ -686,7 +708,7 @@ impl FluxoraStream {
                 &params.recipient,
                 params.deposit_amount,
                 params.rate_per_second,
-                env.ledger().timestamp(),
+                current_time,
                 params.start_time,
                 params.cliff_time,
                 params.end_time,
@@ -696,10 +718,9 @@ impl FluxoraStream {
                 .expect("overflow calculating total batch deposit");
         }
 
-        // Bulk transfer tokens from sender to this contract atomically to save gas
+        // Bulk transfer tokens from sender to this contract atomically to save gas.
         if total_deposit > 0 {
-            let token_client = token::Client::new(&env, &get_token(&env));
-            token_client.transfer(&sender, &env.current_contract_address(), &total_deposit);
+            pull_token(&env, &sender, total_deposit);
         }
 
         // Second pass: generate IDs, persist state, and emit events iteratively

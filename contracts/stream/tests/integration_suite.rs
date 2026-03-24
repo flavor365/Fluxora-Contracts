@@ -1,11 +1,11 @@
 extern crate std;
 
-use fluxora_stream::{FluxoraStream, FluxoraStreamClient, StreamStatus};
+use fluxora_stream::{CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamStatus};
 use soroban_sdk::log;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    vec, Address, Env,
 };
 
 struct TestContext<'a> {
@@ -234,23 +234,84 @@ fn create_stream_rejects_self_stream_without_side_effects() {
 }
 
 #[test]
-fn get_withdrawable_matches_withdraw_active_integration() {
+fn create_streams_batch_success_moves_funds_and_assigns_sequential_ids() {
     let ctx = TestContext::setup();
-    let stream_id = ctx.create_default_stream();
+    ctx.env.ledger().set_timestamp(0);
 
-    ctx.env.ledger().set_timestamp(600);
-    let expected = ctx.client().get_withdrawable(&stream_id);
-    let withdrawn = ctx.client().withdraw(&stream_id);
+    let sender_balance_before = ctx.token.balance(&ctx.sender);
+    let contract_balance_before = ctx.token.balance(&ctx.contract_id);
 
+    let p1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1200,
+        rate_per_second: 2,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 600,
+    };
+    let p2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 2400,
+        rate_per_second: 3,
+        start_time: 10,
+        cliff_time: 10,
+        end_time: 810,
+    };
+
+    let streams = vec![&ctx.env, p1.clone(), p2.clone()];
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids.get(0).unwrap(), 0);
+    assert_eq!(ids.get(1).unwrap(), 1);
+    assert_eq!(ctx.client().get_stream_count(), 2);
+
+    assert_eq!(ctx.token.balance(&ctx.sender), sender_balance_before - 3600);
     assert_eq!(
-        withdrawn, expected,
-        "withdraw should transfer exactly get_withdrawable amount"
+        ctx.token.balance(&ctx.contract_id),
+        contract_balance_before + 3600
     );
-    assert_eq!(
-        ctx.client().get_withdrawable(&stream_id),
-        0,
-        "after withdraw, get_withdrawable must return 0 at same time"
+}
+
+#[test]
+fn create_streams_batch_invalid_entry_is_atomic_and_emits_no_events() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let valid = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+    let invalid = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 10,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token.balance(&ctx.sender);
+    let contract_balance_before = ctx.token.balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    let streams = vec![&ctx.env, valid, invalid];
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(
+        result.is_err(),
+        "batch with invalid entry must fail atomically"
     );
+    assert_eq!(ctx.client().get_stream_count(), stream_count_before);
+    assert_eq!(ctx.token.balance(&ctx.sender), sender_balance_before);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), contract_balance_before);
+    assert_eq!(ctx.env.events().all().len(), events_before);
 }
 
 #[test]

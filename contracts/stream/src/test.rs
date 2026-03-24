@@ -8,7 +8,7 @@ use soroban_sdk::{
 };
 
 use crate::{
-    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamEvent,
+    ContractError, CreateStreamParams, FluxoraStream, FluxoraStreamClient, StreamCreated, StreamEvent,
     StreamStatus, WithdrawalTo,
 };
 
@@ -7232,7 +7232,6 @@ fn test_create_streams_batch_success() {
 }
 
 #[test]
-#[should_panic(expected = "deposit_amount must cover total streamable amount")]
 fn test_create_streams_batch_atomic_failure() {
     let ctx = TestContext::setup();
     ctx.env.ledger().set_timestamp(0);
@@ -7257,10 +7256,36 @@ fn test_create_streams_batch_atomic_failure() {
     };
 
     let streams = vec![&ctx.env, valid_params, invalid_params];
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token().balance(&ctx.sender);
+    let contract_balance_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
 
-    // This should panic due to the invalid parameter in the second stream.
-    // Because Soroban state changes revert on panic, the first stream won't be saved.
-    ctx.client().create_streams(&ctx.sender, &streams);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(result.is_err(), "batch with one invalid stream must fail");
+
+    assert_eq!(
+        ctx.client().get_stream_count(),
+        stream_count_before,
+        "batch failure must not advance stream counter"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.sender),
+        sender_balance_before,
+        "sender balance must not change on batch validation failure"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before,
+        "contract balance must not change on batch validation failure"
+    );
+    assert_eq!(
+        ctx.env.events().all().len(),
+        events_before,
+        "failed batch must emit no created events"
+    );
 }
 
 #[test]
@@ -7392,6 +7417,163 @@ fn test_create_streams_batch_strict_auth() {
 
     let stream_ids = ctx.client().create_streams(&ctx.sender, &streams);
     assert_eq!(stream_ids.len(), 2);
+}
+
+#[test]
+fn test_create_streams_batch_emits_created_events_with_payloads() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let params1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1111,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1111,
+    };
+    let params2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 2222,
+        rate_per_second: 2,
+        start_time: 10,
+        cliff_time: 10,
+        end_time: 1121,
+    };
+    let streams = vec![&ctx.env, params1.clone(), params2.clone()];
+    let events_before = ctx.env.events().all().len();
+
+    let ids = ctx.client().create_streams(&ctx.sender, &streams);
+    assert_eq!(ids.len(), 2);
+
+    let events = ctx.env.events().all();
+    let mut created_payloads: std::vec::Vec<StreamCreated> = std::vec::Vec::new();
+    for i in events_before..events.len() {
+        let event = events.get(i).unwrap();
+        let topic0 = Symbol::from_val(&ctx.env, &event.1.get(0).unwrap());
+        if topic0 == Symbol::new(&ctx.env, "created") {
+            created_payloads.push(StreamCreated::try_from_val(&ctx.env, &event.2).unwrap());
+        }
+    }
+    assert_eq!(
+        created_payloads.len(),
+        2,
+        "batch success must emit one created event per stream"
+    );
+
+    let payload1 = created_payloads[0].clone();
+    let payload2 = created_payloads[1].clone();
+
+    assert_eq!(payload1.stream_id, ids.get(0).unwrap());
+    assert_eq!(payload1.sender, ctx.sender);
+    assert_eq!(payload1.recipient, params1.recipient);
+    assert_eq!(payload1.deposit_amount, params1.deposit_amount);
+
+    assert_eq!(payload2.stream_id, ids.get(1).unwrap());
+    assert_eq!(payload2.sender, ctx.sender);
+    assert_eq!(payload2.recipient, params2.recipient);
+    assert_eq!(payload2.deposit_amount, params2.deposit_amount);
+}
+
+#[test]
+fn test_create_streams_batch_total_deposit_overflow_has_no_side_effects() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    let params1 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: i128::MAX,
+        rate_per_second: i128::MAX,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1,
+    };
+    let params2 = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1,
+    };
+    let streams = vec![&ctx.env, params1, params2];
+
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token().balance(&ctx.sender);
+    let contract_balance_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(
+        result.is_err(),
+        "overflow in total batch deposit must abort the whole call"
+    );
+    assert_eq!(
+        ctx.client().get_stream_count(),
+        stream_count_before,
+        "failed overflow batch must not advance stream counter"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.sender),
+        sender_balance_before,
+        "failed overflow batch must not move sender funds"
+    );
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before,
+        "failed overflow batch must not change contract funds"
+    );
+    assert_eq!(
+        ctx.env.events().all().len(),
+        events_before,
+        "failed overflow batch must emit no events"
+    );
+}
+
+#[test]
+fn test_create_streams_batch_wrong_auth_fails_without_side_effects() {
+    let ctx = TestContext::setup_strict();
+    ctx.env.ledger().set_timestamp(0);
+    let attacker = Address::generate(&ctx.env);
+
+    let params = CreateStreamParams {
+        recipient: Address::generate(&ctx.env),
+        deposit_amount: 1000,
+        rate_per_second: 1,
+        start_time: 0,
+        cliff_time: 0,
+        end_time: 1000,
+    };
+    let streams = vec![&ctx.env, params.clone()];
+    let stream_count_before = ctx.client().get_stream_count();
+    let sender_balance_before = ctx.token().balance(&ctx.sender);
+    let contract_balance_before = ctx.token().balance(&ctx.contract_id);
+    let events_before = ctx.env.events().all().len();
+
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    ctx.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.contract_id,
+            fn_name: "create_streams",
+            args: (&ctx.sender, streams.clone()).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.client().create_streams(&ctx.sender, &streams);
+    }));
+    assert!(result.is_err(), "non-sender auth must be rejected");
+    assert_eq!(ctx.client().get_stream_count(), stream_count_before);
+    assert_eq!(ctx.token().balance(&ctx.sender), sender_balance_before);
+    assert_eq!(
+        ctx.token().balance(&ctx.contract_id),
+        contract_balance_before
+    );
+    assert_eq!(ctx.env.events().all().len(), events_before);
 }
 
 // ---------------------------------------------------------------------------

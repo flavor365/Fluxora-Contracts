@@ -216,6 +216,7 @@ deposit_amount >= rate_per_second * (end_time - start_time)
 | ------------------------ | ----------------- | -------------------------- |
 | `init`                   | Deployer (once)   | None                       |
 | `create_stream`          | Sender            | `sender.require_auth()`    |
+| `create_streams`         | Sender            | `sender.require_auth()` (once per batch) |
 | `pause_stream`           | Sender            | `sender.require_auth()`    |
 | `resume_stream`          | Sender            | `sender.require_auth()`    |
 | `cancel_stream`          | Sender            | `sender.require_auth()`    |
@@ -234,6 +235,19 @@ deposit_amount >= rate_per_second * (end_time - start_time)
 | `top_up_stream`          | Funder address    | `funder.require_auth()`    |
 
 **Note:** Sender-managed functions (`pause_stream`, `resume_stream`, `cancel_stream`) require sender auth. Admin uses separate `_as_admin` entry points.
+
+### create_streams: Batch Atomicity and Single Auth
+
+`create_streams(sender, streams)` is the batch creation entrypoint for treasury operators and indexers.
+
+- Single auth: only `sender` must authorize, and it is checked once for the entire batch.
+- Batch validation: every entry is validated before token transfer or persistence.
+- Atomic transfer: the contract pulls exactly `sum(deposit_amount)` once.
+- Atomic persistence: if any entry fails validation (or total-deposit sum overflows), no stream is created.
+- Event behavior: on success, one `created` event is emitted per created stream; on failure, no `created` events are emitted.
+- Ordering guarantee: returned stream IDs are contiguous and in the same order as input entries.
+
+Scope note: these guarantees are limited to `create_streams` creation semantics. They do not change withdrawal, pause/resume, cancellation, or cleanup rules.
 
 ---
 
@@ -300,13 +314,14 @@ errors relevant to stream creation and timing.
 | Message                                                                 | Function                                   | Trigger                      |
 | ----------------------------------------------------------------------- | ------------------------------------------ | ---------------------------- |
 | `"already initialised"`                                                 | `init`                                     | Re-init attempt              |
-| `"deposit_amount must be positive"`                                     | `create_stream`                            | deposit_amount <= 0          |
-| `"rate_per_second must be positive"`                                    | `create_stream`                            | rate_per_second <= 0         |
-| `"sender and recipient must be different"`                              | `create_stream`                            | sender == recipient          |
-| `"start_time must be before end_time"`                                  | `create_stream`                            | start_time >= end_time       |
-| `"cliff_time must be within [start_time, end_time]"`                    | `create_stream`                            | cliff out of range           |
-| `"deposit_amount must cover total streamable amount (rate * duration)"` | `create_stream`                            | underfunded                  |
-| `"overflow calculating total streamable amount"`                        | `create_stream`                            | overflow in rate \* duration |
+| `"deposit_amount must be positive"`                                     | `create_stream` / `create_streams`         | deposit_amount <= 0          |
+| `"rate_per_second must be positive"`                                    | `create_stream` / `create_streams`         | rate_per_second <= 0         |
+| `"sender and recipient must be different"`                              | `create_stream` / `create_streams`         | sender == recipient          |
+| `"start_time must be before end_time"`                                  | `create_stream` / `create_streams`         | start_time >= end_time       |
+| `"cliff_time must be within [start_time, end_time]"`                    | `create_stream` / `create_streams`         | cliff out of range           |
+| `"deposit_amount must cover total streamable amount (rate * duration)"` | `create_stream` / `create_streams`         | underfunded                  |
+| `"overflow calculating total streamable amount"`                        | `create_stream` / `create_streams`         | overflow in rate \* duration |
+| `"overflow calculating total batch deposit"`                            | `create_streams`                           | overflow in sum of deposits  |
 | `ContractError::StartTimeInPast`                                        | `create_stream` / `create_streams`         | start_time < ledger timestamp |
 | `"stream not found"`                                                    | Various                                    | Invalid stream_id            |
 | `"stream is already paused"`                                            | `pause_stream`                             | Double pause                 |
