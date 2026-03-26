@@ -68,6 +68,12 @@ pub enum ContractError {
     InsufficientBalance = 9,
     /// Deposit amount does not cover the total streamable amount.
     InsufficientDeposit = 10,
+    /// Stream is already in Paused state.
+    StreamAlreadyPaused = 11,
+    /// Stream is not in Paused state (e.g. trying to resume an Active stream).
+    StreamNotPaused = 12,
+    /// Stream is in a terminal state (Completed or Cancelled) and cannot be modified.
+    StreamTerminalState = 13,
 }
 
 #[contracttype]
@@ -202,7 +208,7 @@ pub enum DataKey {
     Stream(u64),               // Persistent storage for individual stream data (O(1) lookup).
     RecipientStreams(Address), // Persistent storage for recipient stream index (sorted by stream_id).
     /// Emergency pause flag (bool). Appended to avoid shifting existing key discriminants.
-    GlobalPaused,
+    GlobalEmergencyPaused,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,16 +296,20 @@ fn load_stream(env: &Env, stream_id: u64) -> Result<Stream, ContractError> {
     Ok(stream)
 }
 
-fn save_stream(env: &Env, stream: &Stream) {
+pub fn save_stream(env: &Env, stream: &Stream) {
     let key = DataKey::Stream(stream.stream_id);
     env.storage().persistent().set(&key, stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
 
-    // Extend TTL on stream save to ensure persistence
-    env.storage().persistent().extend_ttl(
-        &key,
-        PERSISTENT_LIFETIME_THRESHOLD,
-        PERSISTENT_BUMP_AMOUNT,
-    );
+fn is_terminal_state(env: &Env, stream: &Stream) -> bool {
+    if stream.status == StreamStatus::Completed || stream.status == StreamStatus::Cancelled {
+        return true;
+    }
+    // If we've reached the end time, it's effectively terminal even if not yet withdrawn/marked.
+    env.ledger().timestamp() >= stream.end_time
 }
 
 fn remove_stream(env: &Env, stream_id: u64) {
@@ -809,7 +819,11 @@ impl FluxoraStream {
         Self::require_stream_sender(&stream.sender);
 
         if stream.status == StreamStatus::Paused {
-            return Err(ContractError::InvalidState); // Already paused
+            return Err(ContractError::StreamAlreadyPaused);
+        }
+
+        if is_terminal_state(&env, &stream) {
+            return Err(ContractError::StreamTerminalState);
         }
 
         if stream.status != StreamStatus::Active {
@@ -857,8 +871,14 @@ impl FluxoraStream {
         let mut stream = load_stream(&env, stream_id)?;
         Self::require_stream_sender(&stream.sender);
 
+        if stream.status == StreamStatus::Active {
+            return Err(ContractError::StreamNotPaused);
+        }
+        if is_terminal_state(&env, &stream) {
+            return Err(ContractError::StreamTerminalState);
+        }
         if stream.status != StreamStatus::Paused {
-            return Err(ContractError::InvalidState);
+            return Err(ContractError::StreamNotPaused);
         }
 
         stream.status = StreamStatus::Active;
@@ -1001,7 +1021,7 @@ impl FluxoraStream {
             return Err(ContractError::InvalidState);
         }
 
-        if stream.status == StreamStatus::Paused {
+        if stream.status == StreamStatus::Paused && !is_terminal_state(&env, &stream) {
             return Err(ContractError::InvalidState);
         }
 
@@ -1018,7 +1038,7 @@ impl FluxoraStream {
         // CEI: update state before external token transfer to reduce reentrancy risk.
         // Assumption: the token contract does not reenter this contract.
         stream.withdrawn_amount += withdrawable;
-        let completed_now = stream.status == StreamStatus::Active
+        let completed_now = (stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused)
             && stream.withdrawn_amount == stream.deposit_amount;
         if completed_now {
             stream.status = StreamStatus::Completed;
@@ -1109,6 +1129,7 @@ impl FluxoraStream {
         require_not_globally_paused(&env);
         let mut stream = load_stream(&env, stream_id)?;
 
+        // Enforce recipient-only authorization for source of funds
         stream.recipient.require_auth();
 
         if destination == env.current_contract_address() {
@@ -1119,7 +1140,7 @@ impl FluxoraStream {
             return Err(ContractError::InvalidState);
         }
 
-        if stream.status == StreamStatus::Paused {
+        if stream.status == StreamStatus::Paused && !is_terminal_state(&env, &stream) {
             return Err(ContractError::InvalidState);
         }
 
@@ -1131,7 +1152,7 @@ impl FluxoraStream {
         }
 
         stream.withdrawn_amount += withdrawable;
-        let completed_now = stream.status == StreamStatus::Active
+        let completed_now = (stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused)
             && stream.withdrawn_amount == stream.deposit_amount;
         if completed_now {
             stream.status = StreamStatus::Completed;
@@ -1220,7 +1241,7 @@ impl FluxoraStream {
                 return Err(ContractError::Unauthorized);
             }
 
-            if stream.status == StreamStatus::Paused {
+            if stream.status == StreamStatus::Paused && !is_terminal_state(&env, &stream) {
                 return Err(ContractError::InvalidState);
             }
 
@@ -1233,7 +1254,7 @@ impl FluxoraStream {
 
             if withdrawable > 0 {
                 stream.withdrawn_amount += withdrawable;
-                let completed_now = stream.status == StreamStatus::Active
+                let completed_now = (stream.status == StreamStatus::Active || stream.status == StreamStatus::Paused)
                     && stream.withdrawn_amount == stream.deposit_amount;
                 if completed_now {
                     stream.status = StreamStatus::Completed;
@@ -2155,6 +2176,12 @@ impl FluxoraStream {
 
         let mut stream = load_stream(&env, stream_id)?;
 
+        if stream.status == StreamStatus::Paused {
+            return Err(ContractError::StreamAlreadyPaused);
+        }
+        if is_terminal_state(&env, &stream) {
+            return Err(ContractError::StreamTerminalState);
+        }
         if stream.status != StreamStatus::Active {
             return Err(ContractError::InvalidState);
         }
@@ -2197,8 +2224,14 @@ impl FluxoraStream {
         get_admin(&env)?.require_auth();
         let mut stream = load_stream(&env, stream_id)?;
 
+        if stream.status == StreamStatus::Active {
+            return Err(ContractError::StreamNotPaused);
+        }
+        if is_terminal_state(&env, &stream) {
+            return Err(ContractError::StreamTerminalState);
+        }
         if stream.status != StreamStatus::Paused {
-            return Err(ContractError::InvalidState);
+            return Err(ContractError::StreamNotPaused);
         }
 
         stream.status = StreamStatus::Active;
