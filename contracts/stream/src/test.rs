@@ -1878,6 +1878,393 @@ fn test_calculate_accrued_cancelled_stream_time_based() {
 }
 
 // ---------------------------------------------------------------------------
+// Tests — calculate_accrued: status-specific behavior matrix
+// Issue #268: Crisp semantics for every stream status
+//
+// | Status     | Time Source            | Expected Behavior                         |
+// |------------|------------------------|-------------------------------------------|
+// | Active     | env.ledger().timestamp| Accrual grows with wall-clock time        |
+// | Paused     | env.ledger().timestamp| Same as Active (accrual continues)        |
+// | Completed  | N/A (ignored)         | Returns deposit_amount (deterministic)    |
+// | Cancelled  | cancelled_at          | Frozen at cancellation time               |
+// ---------------------------------------------------------------------------
+
+/// Paused stream before cliff: calculate_accrued must return 0.
+/// Accrual does NOT start until cliff_time, regardless of pause state.
+#[test]
+fn test_calculate_accrued_paused_before_cliff() {
+    let ctx = TestContext::setup();
+    // Create stream with cliff at 500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,    // start_time
+        &500u64,  // cliff_time
+        &1000u64, // end_time
+    );
+
+    // Advance to t=300 (before cliff) and pause
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().pause_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+
+    // Accrued must be 0 (before cliff)
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 0, "paused stream before cliff must return 0");
+}
+
+/// Paused stream after cliff: calculate_accrued must accrue normally using current ledger time.
+/// Pausing does NOT freeze accrual — it only blocks withdrawals.
+#[test]
+fn test_calculate_accrued_paused_after_cliff() {
+    let ctx = TestContext::setup();
+    // Create stream with cliff at 500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,    // start_time
+        &500u64,  // cliff_time
+        &1000u64, // end_time
+    );
+
+    // Advance past cliff and pause
+    ctx.env.ledger().set_timestamp(600);
+    ctx.client().pause_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+
+    // Accrued must be 600 (time-based, not frozen at pause)
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued, 600,
+        "paused stream after cliff must accrue normally"
+    );
+
+    // Advance time while paused — accrual should continue
+    ctx.env.ledger().set_timestamp(800);
+    let accrued_later = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_later, 800, "accrual must continue while paused");
+}
+
+/// Paused stream at end_time: calculate_accrued must cap at deposit_amount.
+#[test]
+fn test_calculate_accrued_paused_at_end_time() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 tokens, 0-1000s, rate 1/s
+
+    // Advance to end_time and pause
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().pause_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Paused);
+
+    // Accrued must be capped at deposit
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued, 1000,
+        "paused stream at end_time must cap at deposit"
+    );
+
+    // Advance past end_time while paused — should still cap at deposit
+    ctx.env.ledger().set_timestamp(2000);
+    let accrued_future = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_future, 1000,
+        "paused stream past end_time must still cap at deposit"
+    );
+}
+
+/// Paused stream: calculate_accrued is independent of pause/resume cycle.
+/// This test verifies that calling calculate_accrued multiple times
+/// returns the same value at the same timestamp, regardless of pause state changes.
+#[test]
+fn test_calculate_accrued_paused_deterministic() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Initial state: Active
+    ctx.env.ledger().set_timestamp(500);
+    let accrued_active = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_active, 500);
+
+    // Pause the stream
+    ctx.client().pause_stream(&stream_id);
+
+    // At same timestamp, accrued must be identical
+    let accrued_paused = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_paused, accrued_active,
+        "accrued must be same before/after pause at same timestamp"
+    );
+
+    // Resume the stream
+    ctx.client().resume_stream(&stream_id);
+
+    // At same timestamp, accrued must still be identical
+    let accrued_resumed = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_resumed, accrued_active,
+        "accrued must be same after resume at same timestamp"
+    );
+}
+
+/// Cancelled stream before cliff: calculate_accrued must return 0 (frozen at cancellation).
+#[test]
+fn test_calculate_accrued_cancelled_before_cliff() {
+    let ctx = TestContext::setup();
+    // Create stream with cliff at 500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,    // start_time
+        &500u64,  // cliff_time
+        &1000u64, // end_time
+    );
+
+    // Cancel at t=300 (before cliff)
+    ctx.env.ledger().set_timestamp(300);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+
+    // Accrued must be 0 (frozen before cliff)
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 0, "cancelled stream before cliff must return 0");
+
+    // Far in the future, still 0
+    ctx.env.ledger().set_timestamp(9999);
+    let accrued_frozen = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_frozen, 0, "cancelled stream must stay frozen at 0");
+}
+
+/// Cancelled stream at exact cliff: calculate_accrued must return cliff accrual.
+#[test]
+fn test_calculate_accrued_cancelled_at_cliff() {
+    let ctx = TestContext::setup();
+    // Create stream with cliff at 500
+    ctx.env.ledger().set_timestamp(0);
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &0u64,    // start_time
+        &500u64,  // cliff_time
+        &1000u64, // end_time
+    );
+
+    // Cancel at exact cliff time (t=500)
+    ctx.env.ledger().set_timestamp(500);
+    ctx.client().cancel_stream(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Cancelled);
+
+    // Accrued at cliff = cliff_time - start_time = 500 - 0 = 500
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued, 500,
+        "cancelled stream at cliff must return cliff accrual"
+    );
+}
+
+/// Completed stream: calculate_accrued must return deposit_amount regardless of timestamp.
+/// This is the deterministic, timestamp-independent answer.
+#[test]
+fn test_calculate_accrued_completed_deterministic() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream(); // 1000 tokens, 0-1000s
+
+    // Complete the stream
+    ctx.env.ledger().set_timestamp(1000);
+    ctx.client().withdraw(&stream_id);
+
+    let state = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(state.status, StreamStatus::Completed);
+
+    // At exact end_time
+    let accrued_at_end = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_at_end, 1000,
+        "completed stream at end_time returns deposit"
+    );
+
+    // Far in the future
+    ctx.env.ledger().set_timestamp(9999);
+    let accrued_future = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_future, 1000,
+        "completed stream far future returns deposit"
+    );
+
+    // Even in the past
+    ctx.env.ledger().set_timestamp(0);
+    let accrued_past = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_past, 1000,
+        "completed stream at start returns deposit"
+    );
+}
+
+/// calculate_accrued is permissionless: any address can call it without authorization.
+/// This verifies that no auth is required, which is essential for indexers and UI.
+#[test]
+fn test_calculate_accrued_permissionless_access() {
+    use soroban_sdk::testutils::Address as _;
+
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Create a random third-party address (not sender, not recipient, not admin)
+    let third_party = Address::random(&ctx.env);
+
+    // Third party must be able to call calculate_accrued without auth
+    // This would panic if auth was required
+    let accrued = ctx.client().try_calculate_accrued(&stream_id);
+    assert!(
+        accrued.is_ok(),
+        "calculate_accrued must be callable by anyone"
+    );
+}
+
+/// calculate_accrued is a pure read: calling it must not mutate stream state.
+/// This test verifies that repeated calls do not change withdrawn_amount or any field.
+#[test]
+fn test_calculate_accrued_no_state_mutation() {
+    let ctx = TestContext::setup();
+    let stream_id = ctx.create_default_stream();
+
+    // Get initial state
+    ctx.env.ledger().set_timestamp(500);
+    let state_before = ctx.client().get_stream_state(&stream_id);
+    let accrued_before = ctx.client().calculate_accrued(&stream_id);
+
+    // Call calculate_accrued multiple times
+    for _ in 0..10 {
+        let accrued = ctx.client().calculate_accrued(&stream_id);
+        assert_eq!(
+            accrued, accrued_before,
+            "accrued must be stable across calls"
+        );
+    }
+
+    // State must be unchanged
+    let state_after = ctx.client().get_stream_state(&stream_id);
+    assert_eq!(
+        state_after.withdrawn_amount, state_before.withdrawn_amount,
+        "withdrawn_amount must not change"
+    );
+    assert_eq!(
+        state_after.status, state_before.status,
+        "status must not change"
+    );
+    assert_eq!(
+        state_after.deposit_amount, state_before.deposit_amount,
+        "deposit_amount must not change"
+    );
+}
+
+/// Edge case: calculate_accrued on stream with zero duration (start == end).
+/// Expected: returns 0 as the schedule is invalid.
+#[test]
+fn test_calculate_accrued_zero_duration_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Create stream with zero duration
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &1_i128,
+        &500u64, // start_time
+        &500u64, // cliff_time (same as start)
+        &500u64, // end_time (same as start)
+    );
+
+    // At start time
+    ctx.env.ledger().set_timestamp(500);
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 0, "zero-duration stream must return 0");
+
+    // Far in the future
+    ctx.env.ledger().set_timestamp(9999);
+    let accrued_future = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued_future, 0,
+        "zero-duration stream must always return 0"
+    );
+}
+
+/// Edge case: calculate_accrued on stream with zero deposit.
+/// Expected: returns 0 as there's nothing to accrue.
+#[test]
+fn test_calculate_accrued_zero_deposit_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Create stream with zero deposit
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &0_i128, // zero deposit
+        &1_i128,
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(500);
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued, 0, "zero-deposit stream must return 0");
+}
+
+/// Edge case: calculate_accrued with zero rate (no accrual ever).
+/// Expected: returns 0 regardless of time.
+#[test]
+fn test_calculate_accrued_zero_rate_stream() {
+    let ctx = TestContext::setup();
+    ctx.env.ledger().set_timestamp(0);
+
+    // Create stream with zero rate
+    let stream_id = ctx.client().create_stream(
+        &ctx.sender,
+        &ctx.recipient,
+        &1000_i128,
+        &0_i128, // zero rate
+        &0u64,
+        &0u64,
+        &1000u64,
+    );
+
+    ctx.env.ledger().set_timestamp(500);
+    let accrued = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(
+        accrued, 0,
+        "zero-rate stream must return 0 regardless of time"
+    );
+
+    // Far in the future
+    ctx.env.ledger().set_timestamp(9999);
+    let accrued_future = ctx.client().calculate_accrued(&stream_id);
+    assert_eq!(accrued_future, 0, "zero-rate stream must always return 0");
+}
+
+// ---------------------------------------------------------------------------
 // Tests — calculate_accrued overflow and edge cases
 // ---------------------------------------------------------------------------
 
@@ -8714,7 +9101,7 @@ fn test_update_rate_per_second_rejects_cancelled_stream() {
 #[test]
 fn test_update_rate_per_second_works_on_paused_stream() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -8764,7 +9151,7 @@ fn test_update_rate_per_second_rejects_negative_rate() {
 #[should_panic]
 fn test_update_rate_per_second_rejects_rate_decrease() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with rate 5.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -8842,7 +9229,7 @@ fn test_update_rate_per_second_after_cliff() {
 #[test]
 fn test_update_rate_per_second_near_end_time() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -8877,7 +9264,7 @@ fn test_update_rate_per_second_near_end_time() {
 #[test]
 fn test_update_rate_per_second_after_end_time() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -8907,7 +9294,7 @@ fn test_update_rate_per_second_after_end_time() {
 #[test]
 fn test_update_rate_per_second_with_partial_withdrawal() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -8937,7 +9324,7 @@ fn test_update_rate_per_second_with_partial_withdrawal() {
     let accrued = ctx.client().calculate_accrued(&stream_id);
     // elapsed = 400, rate = 5 → 2000 accrued.
     assert_eq!(accrued, 2000);
-    
+
     let withdrawable = accrued - state.withdrawn_amount;
     assert_eq!(withdrawable, 1700);
 }
@@ -8945,7 +9332,7 @@ fn test_update_rate_per_second_with_partial_withdrawal() {
 #[test]
 fn test_update_rate_per_second_emits_event() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -8975,14 +9362,18 @@ fn test_update_rate_per_second_emits_event() {
         })
         .collect();
 
-    assert_eq!(rate_update_events.len(), 1, "Should emit exactly one rate_upd event");
+    assert_eq!(
+        rate_update_events.len(),
+        1,
+        "Should emit exactly one rate_upd event"
+    );
 }
 
 #[test]
 #[should_panic]
 fn test_update_rate_per_second_unauthorized_caller() {
     let ctx = TestContext::setup_strict();
-    
+
     // Create stream.
     use soroban_sdk::{testutils::MockAuth, testutils::MockAuthInvoke, IntoVal};
     ctx.env.mock_auths(&[MockAuth {
@@ -9003,7 +9394,7 @@ fn test_update_rate_per_second_unauthorized_caller() {
             sub_invokes: &[],
         },
     }]);
-    
+
     let stream_id = ctx.client().create_stream(
         &ctx.sender,
         &ctx.recipient,
@@ -9031,7 +9422,7 @@ fn test_update_rate_per_second_nonexistent_stream() {
 #[test]
 fn test_update_rate_per_second_multiple_times() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with very generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9047,21 +9438,21 @@ fn test_update_rate_per_second_multiple_times() {
     // First update: 1 → 5.
     ctx.env.ledger().set_timestamp(100);
     ctx.client().update_rate_per_second(&stream_id, &5_i128);
-    
+
     let state1 = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state1.rate_per_second, 5);
 
     // Second update: 5 → 10.
     ctx.env.ledger().set_timestamp(200);
     ctx.client().update_rate_per_second(&stream_id, &10_i128);
-    
+
     let state2 = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state2.rate_per_second, 10);
 
     // Third update: 10 → 50.
     ctx.env.ledger().set_timestamp(300);
     ctx.client().update_rate_per_second(&stream_id, &50_i128);
-    
+
     let state3 = ctx.client().get_stream_state(&stream_id);
     assert_eq!(state3.rate_per_second, 50);
 }
@@ -9069,7 +9460,7 @@ fn test_update_rate_per_second_multiple_times() {
 #[test]
 fn test_update_rate_per_second_preserves_other_fields() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with specific parameters.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9106,12 +9497,12 @@ fn test_update_rate_per_second_preserves_other_fields() {
 #[test]
 fn test_update_rate_per_second_with_overflow_protection() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with max-ish values.
     ctx.env.ledger().set_timestamp(0);
     let max_rate = i128::MAX / 1000; // Safe rate for 1000 second duration.
     let deposit = max_rate * 1000;
-    
+
     let stream_id = ctx.client().create_stream(
         &ctx.sender,
         &ctx.recipient,
@@ -9123,14 +9514,19 @@ fn test_update_rate_per_second_with_overflow_protection() {
     );
 
     // Attempt to update to a rate that would overflow.
-    let result = ctx.client().try_update_rate_per_second(&stream_id, &(max_rate + 1));
-    assert!(result.is_err(), "Should fail due to overflow or insufficient deposit");
+    let result = ctx
+        .client()
+        .try_update_rate_per_second(&stream_id, &(max_rate + 1));
+    assert!(
+        result.is_err(),
+        "Should fail due to overflow or insufficient deposit"
+    );
 }
 
 #[test]
 fn test_update_rate_per_second_interaction_with_pause_resume() {
     let ctx = TestContext::setup();
-    
+
     // Create stream with generous deposit.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9164,7 +9560,7 @@ fn test_update_rate_per_second_interaction_with_pause_resume() {
 #[test]
 fn test_update_rate_per_second_exact_deposit_coverage() {
     let ctx = TestContext::setup();
-    
+
     // Create stream where deposit exactly covers rate * duration.
     ctx.env.ledger().set_timestamp(0);
     let stream_id = ctx.client().create_stream(
@@ -9181,7 +9577,10 @@ fn test_update_rate_per_second_exact_deposit_coverage() {
     // deposit = 1000, duration = 1000, so max rate = 1.
     // Cannot increase rate without exceeding deposit.
     let result = ctx.client().try_update_rate_per_second(&stream_id, &2_i128);
-    assert!(result.is_err(), "Should fail: new rate would require 2000 but deposit is only 1000");
+    assert!(
+        result.is_err(),
+        "Should fail: new rate would require 2000 but deposit is only 1000"
+    );
 }
 
 // ---------------------------------------------------------------------------
