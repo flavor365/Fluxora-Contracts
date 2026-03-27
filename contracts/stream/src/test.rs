@@ -14133,6 +14133,8 @@ fn test_top_up_stream_overflow() {
         Ok(Error::from_contract_error(
             ContractError::ArithmeticOverflow as u32
         ))
+    );
+}
 
 // ---------------------------------------------------------------------------
 // §GAS  Gas / budget review: hot paths and batching

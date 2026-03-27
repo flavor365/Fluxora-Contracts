@@ -731,7 +731,6 @@ impl FluxoraStream {
                 .unwrap_or_else(|| {
                     panic_with_error!(env, ContractError::ArithmeticOverflow);
                 });
-                .ok_or(ContractError::InvalidParams)?; // overflow
         }
 
         // Bulk transfer tokens from sender to this contract atomically to save gas.
@@ -1573,11 +1572,6 @@ impl FluxoraStream {
             .unwrap_or_else(|| {
                 panic_with_error!(env, ContractError::ArithmeticOverflow);
             });
-        assert!(
-            stream.deposit_amount >= total_streamable,
-            "deposit_amount must cover total streamable amount for new rate"
-        );
-            .ok_or(ContractError::InvalidParams)?; // overflow
 
         if stream.deposit_amount < total_streamable {
             return Err(ContractError::InsufficientDeposit);
@@ -1659,7 +1653,6 @@ impl FluxoraStream {
             .unwrap_or_else(|| {
                 panic_with_error!(env, ContractError::ArithmeticOverflow);
             });
-            .ok_or(ContractError::InvalidParams)?; // overflow
 
         // Deposit must still be sufficient to cover the shortened schedule (by construction
         // this should hold given the original validation, but we keep an explicit assert).
@@ -1750,7 +1743,6 @@ impl FluxoraStream {
             .unwrap_or_else(|| {
                 panic_with_error!(env, ContractError::ArithmeticOverflow);
             });
-            .ok_or(ContractError::InvalidParams)?; // overflow
 
         if new_total_streamable > stream.deposit_amount {
             return Err(ContractError::InsufficientDeposit);
