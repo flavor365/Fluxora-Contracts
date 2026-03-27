@@ -2,7 +2,9 @@
 
 mod accrual;
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, token, Address, Env};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, panic_with_error, symbol_short, token, Address, Env,
+};
 
 // ---------------------------------------------------------------------------
 // TTL constants
@@ -56,14 +58,16 @@ pub enum ContractError {
     ContractPaused = 4,
     /// Start time is before the current ledger timestamp.
     StartTimeInPast = 5,
+    /// Arithmetic overflow in stream calculations (e.g. deposit total).
+    ArithmeticOverflow = 6,
     /// Caller is not authorized to perform this operation.
-    Unauthorized = 6,
+    Unauthorized = 7,
     /// Contract is already initialized.
-    AlreadyInitialised = 7,
+    AlreadyInitialised = 8,
     /// Token balance or allowance is insufficient (emulated check if possible, otherwise caught by token client).
-    InsufficientBalance = 8,
+    InsufficientBalance = 9,
     /// Deposit amount does not cover the total streamable amount.
-    InsufficientDeposit = 9,
+    InsufficientDeposit = 10,
 }
 
 #[contracttype]
@@ -451,7 +455,7 @@ impl FluxoraStream {
         let duration = (end_time - start_time) as i128;
         let total_streamable = rate_per_second
             .checked_mul(duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .ok_or(ContractError::ArithmeticOverflow)?; // overflow
 
         if deposit_amount < total_streamable {
             return Err(ContractError::InsufficientDeposit);
@@ -744,7 +748,9 @@ impl FluxoraStream {
             )?;
             total_deposit = total_deposit
                 .checked_add(params.deposit_amount)
-                .ok_or(ContractError::InvalidParams)?; // overflow
+                .unwrap_or_else(|| {
+                    panic_with_error!(env, ContractError::ArithmeticOverflow);
+                });
         }
 
         // Bulk transfer tokens from sender to this contract atomically to save gas.
@@ -1610,7 +1616,9 @@ impl FluxoraStream {
         let duration = (stream.end_time - stream.start_time) as i128;
         let total_streamable = new_rate_per_second
             .checked_mul(duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         if stream.deposit_amount < total_streamable {
             return Err(ContractError::InsufficientDeposit);
@@ -1690,7 +1698,9 @@ impl FluxoraStream {
         let new_max_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         // Deposit must still be sufficient to cover the shortened schedule (by construction
         // this should hold given the original validation, but we keep an explicit assert).
@@ -1779,7 +1789,9 @@ impl FluxoraStream {
         let new_total_streamable = stream
             .rate_per_second
             .checked_mul(new_duration)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .unwrap_or_else(|| {
+                panic_with_error!(env, ContractError::ArithmeticOverflow);
+            });
 
         if new_total_streamable > stream.deposit_amount {
             return Err(ContractError::InsufficientDeposit);
@@ -1855,7 +1867,7 @@ impl FluxoraStream {
         stream.deposit_amount = stream
             .deposit_amount
             .checked_add(amount)
-            .ok_or(ContractError::InvalidParams)?; // overflow
+            .ok_or(ContractError::ArithmeticOverflow)?; // overflow
 
         save_stream(&env, &stream);
 
