@@ -2133,8 +2133,6 @@ fn test_calculate_accrued_completed_deterministic() {
 /// This verifies that no auth is required, which is essential for indexers and UI.
 #[test]
 fn test_calculate_accrued_permissionless_access() {
-    use soroban_sdk::testutils::Address as _;
-
     let ctx = TestContext::setup();
     let stream_id = ctx.create_default_stream();
 

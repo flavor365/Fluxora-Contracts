@@ -446,6 +446,18 @@ mod property_monotonicity {
         times
     }
 
+    fn sort_array(arr: &mut [u64]) {
+        for i in 0..arr.len() {
+            for j in 0..arr.len() - i - 1 {
+                if arr[j] > arr[j + 1] {
+                    let temp = arr[j];
+                    arr[j] = arr[j + 1];
+                    arr[j + 1] = temp;
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Property 1: Monotonicity — accrued never decreases as time advances
     // -----------------------------------------------------------------------
@@ -455,7 +467,8 @@ mod property_monotonicity {
     #[test]
     fn prop_monotonic_over_dense_grid() {
         for &(start, cliff, end, rate, deposit) in STREAMS {
-            let times = time_grid(start, cliff, end);
+            let mut times = time_grid(start, cliff, end);
+            sort_array(&mut times);
             let mut prev = calculate_accrued_amount(start, cliff, end, rate, deposit, times[0]);
 
             for &t in times.iter().skip(1) {
