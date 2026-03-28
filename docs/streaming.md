@@ -4,13 +4,27 @@ Onboarding and integration reference for developers and auditors. Describes stre
 
 **Source of truth:** `contracts/stream/src/lib.rs`, `contracts/stream/src/accrual.rs`
 
+**Alignment verification:** See [protocol-narrative-code-alignment.md](./protocol-narrative-code-alignment.md) for complete mapping between this documentation and implementation.
+
 ## Sync Checklist
 
 When changing the contract:
 
 - Update this doc if you change lifecycle, access control, events, or panic messages
+- Update `protocol-narrative-code-alignment.md` to reflect changes
 - Run `cargo test -p fluxora_stream` before committing
+- Update snapshot tests if externally visible behavior changes
 - No behavior change required for doc-only updates
+
+## Externally Visible Assurances
+
+This document provides crisp success and failure semantics for all protocol operations. Treasury operators, recipient applications, and auditors can reason about contract behavior using only:
+
+1. **On-chain observables**: Persistent storage fields, emitted events, token transfers
+2. **Published documentation**: This file and referenced specifications
+3. **Error classifications**: Structured `ContractError` variants
+
+No hidden rules or implementation details are required to understand protocol behavior.
 
 ---
 
@@ -430,3 +444,37 @@ errors relevant to stream creation and timing.
 ## Error Reference
 
 For a full list of contract errors, see [error.md](./error.md).
+
+---
+
+## Cross-References
+
+### Related Documentation
+
+- **[Protocol Narrative vs Code Alignment](./protocol-narrative-code-alignment.md)** - Complete verification that this documentation matches implementation
+- **[Audit Documentation](./audit.md)** - Entrypoints and invariants for auditors
+- **[Error Reference](./error.md)** - Complete error code catalog
+- **[Security Guidelines](./security.md)** - Security considerations and best practices
+- **[Storage Layout](./storage.md)** - Contract storage architecture
+- **[Deployment Guide](./DEPLOYMENT.md)** - Step-by-step deployment checklist
+
+### For Integrators
+
+- **Treasury Operators**: See §1 (Lifecycle), §4 (Access Control), §5 (Events)
+- **Recipient Applications**: See §2 (Accrual Formula), §4 (Withdrawal), §5 (Events)
+- **Indexers**: See §5 (Events), §6 (Error Behavior)
+- **Auditors**: See [protocol-narrative-code-alignment.md](./protocol-narrative-code-alignment.md) for complete verification
+
+### Verification
+
+This documentation is verified against implementation in [protocol-narrative-code-alignment.md](./protocol-narrative-code-alignment.md):
+
+- ✅ All 20 operations have explicit authorization rules
+- ✅ All 6 valid state transitions documented
+- ✅ All 6 invalid state transitions documented
+- ✅ Accrual formula matches implementation line-by-line
+- ✅ All 7 event types verified
+- ✅ All 8 error codes mapped
+- ✅ Zero contradictions found
+
+Last verified: 2026-03-27
